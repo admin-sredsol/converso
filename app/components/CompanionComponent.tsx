@@ -7,6 +7,8 @@ import Image from "next/image";
 import Lottie, { LottieRefCurrentProps } from "lottie-react";
 import soundwaves from "@/constants/soundwaves.json";
 import { addToSessionHistory } from "@/lib/actions/companion.actions";
+import type { Message } from "@/types/vapi";
+import type { CompanionComponentProps, SavedMessage } from "@/types";
 
 enum CallStatus {
   INACTIVE = "INACTIVE",
