@@ -31,6 +31,10 @@ const CompanionComponent = ({
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [isMuted, setIsMuted] = useState(false);
   const [messages, setMessages] = useState<SavedMessage[]>([]);
+  const [volumeLevel, setVolumeLevel] = useState(0);
+  const [retryCount, setRetryCount] = useState(0);
+  const [isReconnecting, setIsReconnecting] = useState(false);
+  const [lastError, setLastError] = useState<string | null>(null);
 
   const lottieRef = useRef<LottieRefCurrentProps>(null);
 
@@ -45,24 +49,62 @@ const CompanionComponent = ({
   }, [isSpeaking, lottieRef]);
 
   useEffect(() => {
-    const onCallStart = () => setCallStatus(CallStatus.ACTIVE);
+    const onCallStart = () => {
+      console.log("Call started - microphone should be active");
+      setCallStatus(CallStatus.ACTIVE);
+      setIsReconnecting(false);
+      setLastError(null);
+      setRetryCount(0);
+    };
 
     const onCallEnd = () => {
+      console.log("Call ended");
       setCallStatus(CallStatus.FINISHED);
       addToSessionHistory(companionId);
     };
 
     const onMessage = (message: Message) => {
+      console.log("Message received:", message);
       if (message.type === "transcript" && message.transcriptType === "final") {
         const newMessage = { role: message.role, content: message.transcript };
         setMessages((prev) => [newMessage, ...prev]);
       }
     };
 
-    const onSpeechStart = () => setIsSpeaking(true);
-    const onSpeechEnd = () => setIsSpeaking(false);
+    const onSpeechStart = () => {
+      console.log("Speech started");
+      setIsSpeaking(true);
+    };
+    const onSpeechEnd = () => {
+      console.log("Speech ended");
+      setIsSpeaking(false);
+    };
 
-    const onError = (error: Error) => console.log("Error", error);
+    const onVolumeLevel = (level: number) => {
+      setVolumeLevel(level);
+    };
+
+    const onError = (error: Error) => {
+      console.error("Vapi Error:", error);
+      setLastError(error?.message ?? "Unknown error");
+      if (
+        typeof error?.message === "string" &&
+        error.message
+          .toLowerCase()
+          .includes("transport changed to disconnected")
+      ) {
+        void attemptReconnect();
+        return;
+      }
+      if (
+        typeof error?.message === "string" &&
+        error.message.toLowerCase().includes("permission")
+      ) {
+        alert(
+          "Microphone permissions are required. Please allow mic access in your browser and restart the session."
+        );
+      }
+    };
 
     vapi.on("call-start", onCallStart);
     vapi.on("call-end", onCallEnd);
@@ -70,6 +112,7 @@ const CompanionComponent = ({
     vapi.on("error", onError);
     vapi.on("speech-start", onSpeechStart);
     vapi.on("speech-end", onSpeechEnd);
+    vapi.on("volume-level", onVolumeLevel);
 
     return () => {
       vapi.off("call-start", onCallStart);
@@ -78,6 +121,7 @@ const CompanionComponent = ({
       vapi.off("error", onError);
       vapi.off("speech-start", onSpeechStart);
       vapi.off("speech-end", onSpeechEnd);
+      vapi.off("volume-level", onVolumeLevel);
     };
   }, [companionId]);
 
@@ -87,12 +131,20 @@ const CompanionComponent = ({
     setIsMuted(!isMuted);
   };
 
-  const handleCall = async () => {
-    setCallStatus(CallStatus.CONNECTING);
+  const startSession = async () => {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    console.log("Microphone permission granted", stream.getAudioTracks());
 
     const assistantOverrides = {
       variableValues: { subject, topic, style },
-      clientMessages: ["transcript"],
+      clientMessages: [
+        "transcript",
+        "hang",
+        "function-call",
+        "speech-update",
+        "metadata",
+        "conversation-update",
+      ],
       serverMessages: [],
     };
 
@@ -100,9 +152,43 @@ const CompanionComponent = ({
     vapi.start(configureAssistant(voice, style), assistantOverrides);
   };
 
+  const handleCall = async () => {
+    try {
+      console.log("Starting call...");
+      setCallStatus(CallStatus.CONNECTING);
+      await startSession();
+    } catch (error) {
+      console.error("Failed to start call:", error);
+      alert(
+        "Failed to access microphone. Please allow microphone permissions and try again."
+      );
+      setCallStatus(CallStatus.INACTIVE);
+    }
+  };
+
+  const attemptReconnect = async () => {
+    if (isReconnecting || retryCount >= 3) return;
+    setIsReconnecting(true);
+    console.log("Attempting reconnect... (", retryCount + 1, "/ 3 )");
+    try {
+      vapi.stop();
+      await new Promise((r) => setTimeout(r, 500));
+      setCallStatus(CallStatus.CONNECTING);
+      await startSession();
+      setRetryCount((r) => r + 1);
+      setIsReconnecting(false);
+    } catch (err) {
+      console.error("Reconnect failed:", err);
+      setIsReconnecting(false);
+    }
+  };
+
   const handleDisconnect = () => {
     setCallStatus(CallStatus.FINISHED);
     vapi.stop();
+    setIsReconnecting(false);
+    setRetryCount(0);
+    setLastError(null);
   };
 
   return (
@@ -176,6 +262,12 @@ const CompanionComponent = ({
               {isMuted ? "Turn on microphone" : "Turn off microphone"}
             </p>
           </button>
+          {callStatus === CallStatus.ACTIVE && (
+            <div className="flex items-center gap-2 text-sm">
+              <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse"></div>
+              <span>Mic Level: {Math.round(volumeLevel * 100)}%</span>
+            </div>
+          )}
           <button
             className={cn(
               "rounded-lg py-2 cursor-pointer transition-colors w-full text-white",
@@ -189,9 +281,24 @@ const CompanionComponent = ({
             {callStatus === CallStatus.ACTIVE
               ? "End Session"
               : callStatus === CallStatus.CONNECTING
-              ? "Connecting"
+              ? isReconnecting
+                ? "Reconnecting..."
+                : "Connecting"
               : "Start Session"}
           </button>
+          {callStatus !== CallStatus.ACTIVE && lastError && (
+            <div className="mt-2 text-xs text-red-600">
+              {lastError}
+              {retryCount < 3 && (
+                <button
+                  className="ml-2 underline text-primary"
+                  onClick={() => void attemptReconnect()}
+                >
+                  Try reconnect
+                </button>
+              )}
+            </div>
+          )}
         </div>
       </section>
 
